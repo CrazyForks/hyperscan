@@ -117,6 +117,85 @@ char validScratch(const struct RoseEngine *t, const struct hs_scratch *s) {
 }
 
 static really_inline
+char stateRegionInRange(u32 offset, u32 size, u32 end) {
+    return offset <= end && size <= end - offset;
+}
+
+/*
+ * Validate block-state vectors before scan-time use so forged databases
+ * cannot place these regions beyond stateOffsets.end.
+ */
+static really_inline
+char validBlockStateLayoutForScan(const struct RoseEngine *rose) {
+    const struct RoseStateOffsets *so = &rose->stateOffsets;
+    const u32 end = so->end;
+
+    if (unlikely(rose->ekeyCount > MMB_MAX_BITS)) {
+        DEBUG_PRINTF("bad ekey count\n");
+        return 0;
+    }
+    if (unlikely(rose->lkeyCount > MMB_MAX_BITS ||
+                 rose->lopCount > MMB_MAX_BITS - rose->lkeyCount)) {
+        DEBUG_PRINTF("bad logical key count\n");
+        return 0;
+    }
+    if (unlikely(rose->ckeyCount > MMB_MAX_BITS)) {
+        DEBUG_PRINTF("bad ckey count\n");
+        return 0;
+    }
+
+    if (unlikely(!stateRegionInRange(so->exhausted, so->exhausted_size,
+                                     end))) {
+        DEBUG_PRINTF("bad exhausted region\n");
+        return 0;
+    }
+    if (unlikely(so->exhausted_size != mmbit_size(rose->ekeyCount))) {
+        DEBUG_PRINTF("bad exhausted size\n");
+        return 0;
+    }
+
+    const u32 logicalCount = rose->lkeyCount + rose->lopCount;
+    if (unlikely(!stateRegionInRange(so->logicalVec, so->logicalVec_size,
+                                     end))) {
+        DEBUG_PRINTF("bad logical region\n");
+        return 0;
+    }
+    if (unlikely(so->logicalVec_size != mmbit_size(logicalCount))) {
+        DEBUG_PRINTF("bad logical size\n");
+        return 0;
+    }
+
+    if (unlikely(!stateRegionInRange(so->combVec, so->combVec_size, end))) {
+        DEBUG_PRINTF("bad combination region\n");
+        return 0;
+    }
+    if (unlikely(so->combVec_size != mmbit_size(rose->ckeyCount))) {
+        DEBUG_PRINTF("bad combination size\n");
+        return 0;
+    }
+
+    if (rose->somLocationCount) {
+        if (unlikely(so->somMultibit_size !=
+                     mmbit_size(rose->somLocationCount))) {
+            DEBUG_PRINTF("bad som multibit size\n");
+            return 0;
+        }
+        if (unlikely(!stateRegionInRange(so->somValid, so->somMultibit_size,
+                                         end))) {
+            DEBUG_PRINTF("bad somValid region\n");
+            return 0;
+        }
+        if (unlikely(!stateRegionInRange(so->somWritable,
+                                         so->somMultibit_size, end))) {
+            DEBUG_PRINTF("bad somWritable region\n");
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+static really_inline
 void populateCoreInfo(struct hs_scratch *s, const struct RoseEngine *rose,
                       char *state, match_event_handler onEvent, void *userCtx,
                       const char *data, size_t length, const u8 *history,
@@ -207,6 +286,10 @@ void pureLiteralBlockExec(const struct RoseEngine *rose,
     assert(scratch);
 
     const struct HWLM *ftable = getFLiteralMatcher(rose);
+    if (unlikely(!ftable)) {
+        scratch->core_info.status |= STATUS_ERROR;
+        return;
+    }
     initSomState(rose, scratch->core_info.state);
     const u8 *buffer = scratch->core_info.buf;
     size_t length = scratch->core_info.len;
@@ -220,9 +303,12 @@ void pureLiteralBlockExec(const struct RoseEngine *rose,
 }
 
 static really_inline
-void initOutfixQueue(struct mq *q, u32 qi, const struct RoseEngine *t,
+int initOutfixQueue(struct mq *q, u32 qi, const struct RoseEngine *t,
                      struct hs_scratch *scratch) {
     const struct NfaInfo *info = getNfaInfoByQueue(t, qi);
+    if (unlikely(!info)) {
+        return 0;
+    }
     q->nfa = getNfaByInfo(t, info);
     q->end = 0;
     q->cur = 0;
@@ -240,6 +326,7 @@ void initOutfixQueue(struct mq *q, u32 qi, const struct RoseEngine *t,
     DEBUG_PRINTF("qi=%u, offset=%llu, fullState=%u, streamState=%u, "
                  "state=%u\n", qi, q->offset, info->fullStateOffset,
                  info->stateOffset, *(u32 *)q->state);
+    return 1;
 }
 
 static never_inline
@@ -255,6 +342,9 @@ void soleOutfixBlockExec(const struct RoseEngine *t,
     assert(!t->fmatcherOffset);
 
     const struct NFA *nfa = getNfaByQueue(t, 0);
+    if (unlikely(!nfa)) {
+        return;
+    }
 
     size_t len = nfaRevAccelCheck(nfa, scratch->core_info.buf,
                                   scratch->core_info.len);
@@ -263,7 +353,9 @@ void soleOutfixBlockExec(const struct RoseEngine *t,
     }
 
     struct mq *q = scratch->queues;
-    initOutfixQueue(q, 0, t, scratch);
+    if (unlikely(!initOutfixQueue(q, 0, t, scratch))) {
+        return;
+    }
     q->length = len; /* adjust for rev_accel */
     nfaQueueInitState(nfa, q);
     pushQueueAt(q, 0, MQE_START, 0);
@@ -333,6 +425,10 @@ hs_error_t HS_CDECL hs_scan(const hs_database_t *db, const char *data,
 
     if (unlikely(rose->mode != HS_MODE_BLOCK)) {
         return HS_DB_MODE_ERROR;
+    }
+
+    if (unlikely(!validBlockStateLayoutForScan(rose))) {
+        return HS_INVALID;
     }
 
     if (unlikely(!validScratch(rose, scratch))) {
@@ -553,6 +649,14 @@ hs_error_t HS_CDECL hs_open_stream(const hs_database_t *db,
         return err;
     }
 
+    // Validate bytecode offset is within the expected header region.
+    // db_copy_bytecode() sets it to offsetof(bytes) - shift (shift in 0..63),
+    // so valid offsets lie in [offsetof(padding), offsetof(bytes)].
+    if (unlikely(db->bytecode < offsetof(struct hs_database, padding) ||
+                 db->bytecode > offsetof(struct hs_database, bytes))) {
+        return HS_INVALID;
+    }
+
     const struct RoseEngine *rose = hs_get_bytecode(db);
     if (unlikely(!ISALIGNED_16(rose))) {
         return HS_INVALID;
@@ -560,6 +664,37 @@ hs_error_t HS_CDECL hs_open_stream(const hs_database_t *db,
 
     if (unlikely(rose->mode != HS_MODE_STREAM)) {
         return HS_DB_MODE_ERROR;
+    }
+
+    // Validate stateOffsets layout to prevent heap overflow from forged
+    // databases (CWE-122). These invariants mirror fillStateOffsets() in
+    // rose_build_bytecode.cpp: every offset region used by init_stream()
+    // and its helpers must be bounded by stateOffsets.end.
+    // The status byte at offset 0 is always written, so end must be >= 1.
+    if (unlikely(rose->stateOffsets.end < sizeof(u8))) {
+        return HS_INVALID;
+    }
+    if (unlikely(rose->stateOffsets.history > rose->stateOffsets.end)) {
+        return HS_INVALID;
+    }
+    if (unlikely(rose->historyRequired >
+        rose->stateOffsets.end - rose->stateOffsets.history)) {
+        return HS_INVALID;
+    }
+    if (unlikely(rose->stateOffsets.exhausted > rose->stateOffsets.end)) {
+        return HS_INVALID;
+    }
+    if (unlikely(rose->stateOffsets.logicalVec > rose->stateOffsets.end)) {
+        return HS_INVALID;
+    }
+    if (unlikely(rose->stateOffsets.combVec > rose->stateOffsets.end)) {
+        return HS_INVALID;
+    }
+    if (unlikely(rose->stateOffsets.somValid > rose->stateOffsets.end)) {
+        return HS_INVALID;
+    }
+    if (unlikely(rose->stateOffsets.somWritable > rose->stateOffsets.end)) {
+        return HS_INVALID;
     }
 
     size_t stateSize = rose->stateOffsets.end;
@@ -612,9 +747,14 @@ void soleOutfixEodExec(hs_stream_t *id, hs_scratch_t *scratch) {
     assert(!t->fmatcherOffset);
 
     const struct NFA *nfa = getNfaByQueue(t, 0);
+    if (unlikely(!nfa)) {
+        return;
+    }
 
     struct mq *q = scratch->queues;
-    initOutfixQueue(q, 0, t, scratch);
+    if (unlikely(!initOutfixQueue(q, 0, t, scratch))) {
+        return;
+    }
     if (!scratch->core_info.buf_offset) {
         DEBUG_PRINTF("buf_offset is zero\n");
         return; /* no vacuous engines */
@@ -844,9 +984,14 @@ void soleOutfixStreamExec(struct hs_stream *stream_state,
     assert(!t->fmatcherOffset);
 
     const struct NFA *nfa = getNfaByQueue(t, 0);
+    if (unlikely(!nfa)) {
+        return;
+    }
 
     struct mq *q = scratch->queues;
-    initOutfixQueue(q, 0, t, scratch);
+    if (unlikely(!initOutfixQueue(q, 0, t, scratch))) {
+        return;
+    }
     if (!scratch->core_info.buf_offset) {
         nfaQueueInitState(nfa, q);
         pushQueueAt(q, 0, MQE_START, 0);

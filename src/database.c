@@ -41,6 +41,7 @@
 #include "database.h"
 #include "crc32.h"
 #include "rose/rose_internal.h"
+#include "util/compile_error.h"
 #include "util/unaligned.h"
 
 static really_inline
@@ -50,7 +51,7 @@ int db_correctly_aligned(const void *db) {
 
 HS_PUBLIC_API
 hs_error_t HS_CDECL hs_free_database(hs_database_t *db) {
-    if (db && db->magic != HS_DB_MAGIC) {
+    if (db && unlikely(db->magic != HS_DB_MAGIC)) {
         return HS_INVALID;
     }
     hs_database_free(db);
@@ -61,16 +62,16 @@ hs_error_t HS_CDECL hs_free_database(hs_database_t *db) {
 HS_PUBLIC_API
 hs_error_t HS_CDECL hs_serialize_database(const hs_database_t *db, char **bytes,
                                           size_t *serialized_length) {
-    if (!db || !bytes || !serialized_length) {
+    if (unlikely(!db || !bytes || !serialized_length)) {
         return HS_INVALID;
     }
 
-    if (!db_correctly_aligned(db)) {
+    if (unlikely(!db_correctly_aligned(db))) {
         return HS_BAD_ALIGN;
     }
 
     hs_error_t ret = validDatabase(db);
-    if (ret != HS_SUCCESS) {
+    if (unlikely(ret != HS_SUCCESS)) {
         return ret;
     }
 
@@ -78,7 +79,7 @@ hs_error_t HS_CDECL hs_serialize_database(const hs_database_t *db, char **bytes,
 
     char *out = hs_misc_alloc(length);
     ret = hs_check_alloc(out);
-    if (ret != HS_SUCCESS) {
+    if (unlikely(ret != HS_SUCCESS)) {
         hs_misc_free(out);
         return ret;
     }
@@ -113,10 +114,10 @@ hs_error_t HS_CDECL hs_serialize_database(const hs_database_t *db, char **bytes,
 // runtime platform.
 static
 hs_error_t db_check_platform(const u64a p) {
-    if (p != hs_current_platform
+    if (unlikely(p != hs_current_platform
         && p != (hs_current_platform | hs_current_platform_no_avx2)
         && p != (hs_current_platform | hs_current_platform_no_avx512)
-        && p != (hs_current_platform | hs_current_platform_no_avx512vbmi)) {
+        && p != (hs_current_platform | hs_current_platform_no_avx512vbmi))) {
         return HS_DB_PLATFORM_ERROR;
     }
     // passed all checks
@@ -129,11 +130,11 @@ hs_error_t db_check_platform(const u64a p) {
 static
 hs_error_t db_decode_header(const char **bytes, const size_t length,
                             struct hs_database *header) {
-    if (!*bytes) {
+    if (unlikely(!*bytes)) {
         return HS_INVALID;
     }
 
-    if (length < sizeof(struct hs_database)) {
+    if (unlikely(length < sizeof(struct hs_database))) {
         return HS_INVALID;
     }
 
@@ -146,17 +147,17 @@ hs_error_t db_decode_header(const char **bytes, const size_t length,
     memset(header, 0, sizeof(struct hs_database));
 
     header->magic = unaligned_load_u32(buf++);
-    if (header->magic != HS_DB_MAGIC) {
+    if (unlikely(header->magic != HS_DB_MAGIC)) {
         return HS_INVALID;
     }
 
     header->version = unaligned_load_u32(buf++);
-    if (header->version != HS_DB_VERSION) {
+    if (unlikely(header->version != HS_DB_VERSION)) {
         return HS_DB_VERSION_ERROR;
     }
 
     header->length = unaligned_load_u32(buf++);
-    if (length != sizeof(struct hs_database) + header->length) {
+    if (unlikely(length != sizeof(struct hs_database) + header->length)) {
         DEBUG_PRINTF("bad length %zu, expecting %zu\n", length,
                      sizeof(struct hs_database) + header->length);
         return HS_INVALID;
@@ -173,15 +174,81 @@ hs_error_t db_decode_header(const char **bytes, const size_t length,
     return HS_SUCCESS; // Header checks out
 }
 
-// Check the CRC on a database
+// Check the CRC on a database (seeded with HS_DB_CRC_KEY)
 static
 hs_error_t db_check_crc(const hs_database_t *db) {
     const char *bytecode = hs_get_bytecode(db);
-    u32 crc = Crc32c_ComputeBuf(0, bytecode, db->length);
-    if (crc != db->crc32) {
+    u32 crc = Crc32c_ComputeBuf(HS_DB_CRC_KEY, bytecode, db->length);
+    if (unlikely(crc != db->crc32)) {
         DEBUG_PRINTF("crc mismatch! 0x%x != 0x%x\n", crc, db->crc32);
         return HS_INVALID;
     }
+    return HS_SUCCESS;
+}
+
+/**
+ * \brief Validate critical RoseEngine offsets to prevent out-of-bounds
+ * access (CWE-125) when scanning a deserialized database.
+ */
+static
+hs_error_t db_validate_rose_offsets(const hs_database_t *db) {
+    const struct RoseEngine *rose = hs_get_bytecode(db);
+
+    if (unlikely(!rose)) {
+        DEBUG_PRINTF("null rose engine\n");
+        return HS_INVALID;
+    }
+
+    // Get the total RoseEngine size
+    u32 rose_size = rose->size;
+
+    // Validate rose_size itself is reasonable
+    if (unlikely(rose_size < sizeof(struct RoseEngine) || rose_size > db->length)) {
+        DEBUG_PRINTF("invalid rose size: %u (db length: %u)\n",
+                     rose_size, db->length);
+        return HS_INVALID;
+    }
+
+    // Validate critical offsets that are dereferenced during scanning.
+    // Each offset, if non-zero, must be within rose_size bounds.
+#define VALIDATE_OFFSET(field)                                              \
+    if (unlikely(rose->field && rose->field >= rose_size)) {                \
+        DEBUG_PRINTF(#field " out of bounds: %u >= %u\n",                  \
+                     rose->field, rose_size);                               \
+        return HS_INVALID;                                                  \
+    }
+
+    // Literal matcher offsets
+    VALIDATE_OFFSET(fmatcherOffset);
+    VALIDATE_OFFSET(ematcherOffset);
+    VALIDATE_OFFSET(amatcherOffset);
+    VALIDATE_OFFSET(sbmatcherOffset);
+    VALIDATE_OFFSET(drmatcherOffset);
+    VALIDATE_OFFSET(longLitTableOffset);
+    VALIDATE_OFFSET(smallWriteOffset);
+
+    // NFA / left-engine offsets
+    VALIDATE_OFFSET(nfaInfoOffset);
+    VALIDATE_OFFSET(leftOffset);
+    VALIDATE_OFFSET(activeLeftIterOffset);
+
+    // Program offsets
+    VALIDATE_OFFSET(reportProgramOffset);
+    VALIDATE_OFFSET(delayProgramOffset);
+    VALIDATE_OFFSET(anchoredProgramOffset);
+    VALIDATE_OFFSET(eodProgramOffset);
+    VALIDATE_OFFSET(flushCombProgramOffset);
+    VALIDATE_OFFSET(lastFlushCombProgramOffset);
+
+    // Misc offsets
+    VALIDATE_OFFSET(lastByteHistoryIterOffset);
+    VALIDATE_OFFSET(eagerIterOffset);
+    VALIDATE_OFFSET(somRevOffsetOffset);
+    VALIDATE_OFFSET(combInfoMapOffset);
+
+#undef VALIDATE_OFFSET
+
+    DEBUG_PRINTF("rose offset validation passed\n");
     return HS_SUCCESS;
 }
 
@@ -200,30 +267,49 @@ HS_PUBLIC_API
 hs_error_t HS_CDECL hs_deserialize_database_at(const char *bytes,
                                                const size_t length,
                                                hs_database_t *db) {
-    if (!bytes || !db) {
+    if (unlikely(!bytes || !db)) {
         return HS_INVALID;
     }
 
     // We require the user to deserialize into an 8-byte aligned region.
-    if (!ISALIGNED_N(db, 8)) {
+    if (unlikely(!ISALIGNED_N(db, 8))) {
         return HS_BAD_ALIGN;
     }
 
     // Decode the header
     hs_database_t header;
     hs_error_t ret = db_decode_header(&bytes, length, &header);
-    if (ret != HS_SUCCESS) {
+    if (unlikely(ret != HS_SUCCESS)) {
         return ret;
     }
 
     // Make sure the serialized database is for our platform
     ret = db_check_platform(header.platform);
-    if (ret != HS_SUCCESS) {
+    if (unlikely(ret != HS_SUCCESS)) {
         return ret;
     }
 
-    // Zero new space for safety
+    // Calculate total required size
     size_t dblength = sizeof(struct hs_database) + header.length;
+
+    // Additional overflow check for size calculation
+    if (unlikely(dblength < header.length)) {
+        DEBUG_PRINTF("database size calculation overflow\n");
+        return HS_INVALID;
+    }
+
+    // Validate total deserialized size against centralized defensive limit.
+    if (unlikely(dblength > MAX_DATABASE_SIZE)) {
+        DEBUG_PRINTF("database total size exceeds maximum: %zu > %zu\n",
+                     dblength, (size_t)MAX_DATABASE_SIZE);
+        return HS_INVALID;
+    }
+
+    // SECURITY NOTE: This function cannot verify that the user-provided 'db'
+    // buffer is actually large enough to hold 'dblength' bytes. Users MUST
+    // call hs_serialized_database_size() first to determine required size and
+    // allocate sufficient memory. The checks above only prevent obviously
+    // malicious oversized values to mitigate heap buffer overflow (CWE-122).
     memset(db, 0, dblength);
 
     // Copy the decoded header into place
@@ -232,7 +318,13 @@ hs_error_t HS_CDECL hs_deserialize_database_at(const char *bytes,
     // Copy the bytecode into the correctly-aligned location, set offsets
     db_copy_bytecode(bytes, db);
 
-    if (db_check_crc(db) != HS_SUCCESS) {
+    if (unlikely(db_check_crc(db) != HS_SUCCESS)) {
+        return HS_INVALID;
+    }
+
+    // Validate RoseEngine offsets to prevent out-of-bounds access (CWE-125)
+    if (unlikely(db_validate_rose_offsets(db) != HS_SUCCESS)) {
+        DEBUG_PRINTF("rose offset validation failed\n");
         return HS_INVALID;
     }
 
@@ -243,7 +335,7 @@ HS_PUBLIC_API
 hs_error_t HS_CDECL hs_deserialize_database(const char *bytes,
                                             const size_t length,
                                             hs_database_t **db) {
-    if (!bytes || !db) {
+    if (unlikely(!bytes || !db)) {
         return HS_INVALID;
     }
 
@@ -252,21 +344,35 @@ hs_error_t HS_CDECL hs_deserialize_database(const char *bytes,
     // Decode and check the header
     hs_database_t header;
     hs_error_t ret = db_decode_header(&bytes, length, &header);
-    if (ret != HS_SUCCESS) {
+    if (unlikely(ret != HS_SUCCESS)) {
         return ret;
     }
 
     // Make sure the serialized database is for our platform
     ret = db_check_platform(header.platform);
-    if (ret != HS_SUCCESS) {
+    if (unlikely(ret != HS_SUCCESS)) {
         return ret;
     }
 
     // Allocate space for new database
     size_t dblength = sizeof(struct hs_database) + header.length;
+
+    // Check for overflow in size calculation
+    if (unlikely(dblength < header.length)) {
+        DEBUG_PRINTF("database size calculation overflow\n");
+        return HS_INVALID;
+    }
+
+    // Validate total allocation size against centralized defensive limit.
+    if (unlikely(dblength > MAX_DATABASE_SIZE)) {
+        DEBUG_PRINTF("database total size exceeds maximum: %zu > %zu\n",
+                     dblength, (size_t)MAX_DATABASE_SIZE);
+        return HS_INVALID;
+    }
+
     struct hs_database *tempdb = hs_database_alloc(dblength);
     ret = hs_check_alloc(tempdb);
-    if (ret != HS_SUCCESS) {
+    if (unlikely(ret != HS_SUCCESS)) {
         hs_database_free(tempdb);
         return ret;
     }
@@ -280,7 +386,14 @@ hs_error_t HS_CDECL hs_deserialize_database(const char *bytes,
     // Copy the bytecode into the correctly-aligned location, set offsets
     db_copy_bytecode(bytes, tempdb);
 
-    if (db_check_crc(tempdb) != HS_SUCCESS) {
+    if (unlikely(db_check_crc(tempdb) != HS_SUCCESS)) {
+        hs_database_free(tempdb);
+        return HS_INVALID;
+    }
+
+    // Validate RoseEngine offsets to prevent out-of-bounds access (CWE-125)
+    if (unlikely(db_validate_rose_offsets(tempdb) != HS_SUCCESS)) {
+        DEBUG_PRINTF("rose offset validation failed\n");
         hs_database_free(tempdb);
         return HS_INVALID;
     }
@@ -291,7 +404,7 @@ hs_error_t HS_CDECL hs_deserialize_database(const char *bytes,
 
 HS_PUBLIC_API
 hs_error_t HS_CDECL hs_database_size(const hs_database_t *db, size_t *size) {
-    if (!size) {
+    if (unlikely(!size)) {
         return HS_INVALID;
     }
 
@@ -311,11 +424,11 @@ hs_error_t HS_CDECL hs_serialized_database_size(const char *bytes,
     // Decode and check the header
     hs_database_t header;
     hs_error_t ret = db_decode_header(&bytes, length, &header);
-    if (ret != HS_SUCCESS) {
+    if (unlikely(ret != HS_SUCCESS)) {
         return ret;
     }
 
-    if (!size) {
+    if (unlikely(!size)) {
         return HS_INVALID;
     }
 
@@ -324,30 +437,88 @@ hs_error_t HS_CDECL hs_serialized_database_size(const char *bytes,
 }
 
 hs_error_t dbIsValid(const hs_database_t *db) {
-    if (db->magic != HS_DB_MAGIC) {
+    if (unlikely(db->magic != HS_DB_MAGIC)) {
         DEBUG_PRINTF("bad magic\n");
         return HS_INVALID;
     }
 
-    if (db->version != HS_DB_VERSION) {
+    if (unlikely(db->version != HS_DB_VERSION)) {
         DEBUG_PRINTF("bad version\n");
         return HS_DB_VERSION_ERROR;
     }
 
-    if (db_check_platform(db->platform) != HS_SUCCESS) {
+    if (unlikely(db_check_platform(db->platform) != HS_SUCCESS)) {
         DEBUG_PRINTF("bad platform\n");
         return HS_DB_PLATFORM_ERROR;
     }
 
-    if (!ISALIGNED_16(hs_get_bytecode(db))) {
+    if (unlikely(!ISALIGNED_16(hs_get_bytecode(db)))) {
         DEBUG_PRINTF("bad alignment\n");
         return HS_INVALID;
     }
 
     hs_error_t rv = db_check_crc(db);
-    if (rv != HS_SUCCESS) {
+    if (unlikely(rv != HS_SUCCESS)) {
         DEBUG_PRINTF("bad crc\n");
         return rv;
+    }
+
+    // Validate bytecode offset is within the expected header region.
+    if (db->bytecode < offsetof(struct hs_database, padding) ||
+        db->bytecode > offsetof(struct hs_database, bytes)) {
+        DEBUG_PRINTF("bad bytecode offset\n");
+        return HS_INVALID;
+    }
+
+    const struct RoseEngine *rose = hs_get_bytecode(db);
+
+    // Validate stream-state stateOffsets layout (CWE-122).
+    // These invariants mirror fillStateOffsets() in rose_build_bytecode.cpp.
+    // Every offset region dereferenced by init_stream() and its helpers
+    // must be bounded by stateOffsets.end.
+    if (rose->mode == HS_MODE_STREAM) {
+        if (unlikely(rose->stateOffsets.end < sizeof(u8))) {
+            DEBUG_PRINTF("stateOffsets.end too small: %u\n",
+                         rose->stateOffsets.end);
+            return HS_INVALID;
+        }
+        if (unlikely(rose->stateOffsets.history > rose->stateOffsets.end)) {
+            DEBUG_PRINTF("stateOffsets.history > end: %u > %u\n",
+                         rose->stateOffsets.history, rose->stateOffsets.end);
+            return HS_INVALID;
+        }
+        if (unlikely(rose->historyRequired >
+            rose->stateOffsets.end - rose->stateOffsets.history)) {
+            DEBUG_PRINTF("historyRequired overflows end: %u > %u\n",
+                         rose->historyRequired,
+                         rose->stateOffsets.end - rose->stateOffsets.history);
+            return HS_INVALID;
+        }
+        if (unlikely(rose->stateOffsets.exhausted > rose->stateOffsets.end)) {
+            DEBUG_PRINTF("stateOffsets.exhausted > end: %u > %u\n",
+                         rose->stateOffsets.exhausted, rose->stateOffsets.end);
+            return HS_INVALID;
+        }
+        if (unlikely(rose->stateOffsets.logicalVec > rose->stateOffsets.end)) {
+            DEBUG_PRINTF("stateOffsets.logicalVec > end: %u > %u\n",
+                         rose->stateOffsets.logicalVec, rose->stateOffsets.end);
+            return HS_INVALID;
+        }
+        if (unlikely(rose->stateOffsets.combVec > rose->stateOffsets.end)) {
+            DEBUG_PRINTF("stateOffsets.combVec > end: %u > %u\n",
+                         rose->stateOffsets.combVec, rose->stateOffsets.end);
+            return HS_INVALID;
+        }
+        if (unlikely(rose->stateOffsets.somValid > rose->stateOffsets.end)) {
+            DEBUG_PRINTF("stateOffsets.somValid > end: %u > %u\n",
+                         rose->stateOffsets.somValid, rose->stateOffsets.end);
+            return HS_INVALID;
+        }
+        if (unlikely(rose->stateOffsets.somWritable > rose->stateOffsets.end)) {
+            DEBUG_PRINTF("stateOffsets.somWritable > end: %u > %u\n",
+                         rose->stateOffsets.somWritable, rose->stateOffsets.end);
+            return HS_INVALID;
+        }
     }
 
     return HS_SUCCESS;
